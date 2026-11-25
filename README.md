@@ -91,8 +91,11 @@ doubao-tui
 
 ```
 /new                开新会话
+/sessions           会话列表（标 * 的是上次用过的）
 /resume             续等当前会话的未完成轮（不会重发消息）
-/sessions           会话列表
+/resume <会话ID>     切换到指定会话
+/model              查看可用模型
+/model <名称>        切换模型
 /stop               中止当前轮
 /status             会话 ID、阶段、工作区
 /mode work|chat|goal
@@ -123,6 +126,16 @@ TUI 进程
    ```
    匹配到 `[y/N]` 就把提示捞出来，用户按键后往 pty 写 `y\n` / `n\n`。
 3. **stdout 单独走管道**。这样 `--json` 的回执不会和审批文本混在一起；回执里带 `conversationId` / `runId` / `reply.text`，用于续接下一轮。
+
+## 自检
+
+装完后先跑一次：
+
+```bash
+doubao-tui --doctor
+```
+
+它会检查 `doubao` 是否在 PATH、登录态是否有效、本地执行通道是否可用、工作区是否存在。任何一项不过，界面上跑任务都会卡住。
 
 ## 测试
 

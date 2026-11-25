@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from dataclasses import dataclass, field
@@ -153,7 +154,7 @@ PERM_LABELS = {
 }
 MODES = ("work", "chat", "goal")
 COMMAND_HINTS = [
-    "/help", "/new", "/resume", "/sessions", "/stop", "/status",
+    "/help", "/new", "/resume", "/sessions", "/model", "/stop", "/status",
     "/mode", "/perm", "/ws", "/profile", "/clear", "/quit",
 ]
 
@@ -593,6 +594,83 @@ class Runner:
         turn.run_id = run_id
         turn.finished = True
 
+    # -- 只读查询（不占 turn 槽，也不涉及审批）
+
+    def query(self, argv: List[str], formatter, timeout: int = 20) -> None:
+        def work() -> None:
+            try:
+                result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+                out = (result.stdout or "").strip()
+                if out:
+                    message = formatter(out)
+                else:
+                    message = (result.stderr or "").strip() or "没有输出"
+            except Exception as exc:  # 查询失败不应打断会话
+                message = f"查询失败：{exc}"
+            self.events.put(("notice", message))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def list_sessions(self) -> None:
+        argv = [
+            self.config["bin"], "headless", "sessions", "list",
+            "--limit", "10", "--json",
+        ]
+        if self.config.get("profile"):
+            argv += ["--profile", str(self.config["profile"])]
+
+        def formatter(out: str) -> str:
+            data = json.loads(out)
+            rows = data.get("sessions") or []
+            if not rows:
+                return "没有可用的会话"
+            lines = ["最近会话："]
+            for row in rows[:10]:
+                sid = row.get("id") or row.get("conversationId") or ""
+                title = (row.get("title") or "未命名")[:24]
+                mark = "*" if sid == self.config.get("last_conversation") else " "
+                lines.append(f" {mark}{sid}  {title}")
+            lines.append("用 /resume <会话ID> 切换")
+            return "\n".join(lines)
+
+        self.query(argv, formatter)
+
+    def list_models(self) -> None:
+        argv = [self.config["bin"], "headless", "models", "--json"]
+        if self.config.get("profile"):
+            argv += ["--profile", str(self.config["profile"])]
+
+        def formatter(out: str) -> str:
+            data = json.loads(out)
+            rows = data.get("models") or data.get("items") or []
+            if not rows:
+                return "没有取到模型列表"
+            lines = ["可用模型："]
+            for row in rows[:12]:
+                if isinstance(row, str):
+                    lines.append(f"  {row}")
+                else:
+                    name = row.get("name") or row.get("id") or ""
+                    effort = row.get("reasoning") or row.get("effort") or ""
+                    lines.append(f"  {name}{('  reasoning: ' + str(effort)) if effort else ''}")
+            lines.append("用 /model <名称> 切换")
+            return "\n".join(lines)
+
+        self.query(argv, formatter)
+
+    def select_model(self, name: str) -> None:
+        argv = [self.config["bin"], "headless", "model", "select", name, "--json"]
+        if self.config.get("profile"):
+            argv += ["--profile", str(self.config["profile"])]
+
+        def formatter(out: str) -> str:
+            data = json.loads(out)
+            model = data.get("model") or data.get("name") or name
+            effort = data.get("reasoning") or ""
+            return f"模型已切到 {model}" + (f"（reasoning {effort}）" if effort else "")
+
+        self.query(argv, formatter)
+
 
 # ---------------------------------------------------------------- UI
 
@@ -662,6 +740,7 @@ class App:
         self._pending = b""  # 跨 read 的未完成按键/UTF-8 字节
         self._pending_since = 0.0
         self._exit_armed_until = 0.0
+        self._auto_backup: Optional[list] = None
 
     # -- 主循环
 
@@ -685,6 +764,9 @@ class App:
             Message(role="system", text=f"豆包 CLI · 终端会话\n工作区 {ws}\nprofile {profile} · 权限 {self.config.get('permission')}")
         )
         self.state.messages.append(Message(role="system", text="/help 查看按键与命令"))
+        last = self.config.get("last_conversation")
+        if last:
+            self.state.messages.append(Message(role="system", text=f"上次会话 {last} · 用 /resume 续等，或 /sessions 看列表"))
 
     def _loop(self) -> None:
         last_tick = 0.0
@@ -949,6 +1031,9 @@ class App:
             elif kind == "turn_update":
                 self.state.phase = turn.phase
                 self.need_render = True
+            elif kind == "notice":
+                self._system(str(turn))
+                self.need_render = True
             elif kind == "turn_end":
                 self._finish_turn(turn)
 
@@ -974,13 +1059,24 @@ class App:
         self.state.phase = turn.phase
         if turn.conversation_id:
             self.state.conversation_id = turn.conversation_id
+            self.config["last_conversation"] = turn.conversation_id
+            save_config(self.config)
         if turn.run_id:
             self.state.run_id = turn.run_id
+        if self._auto_backup is not None:
+            self.config["auto_approve"] = self._auto_backup
+            self._auto_backup = None
         text = Runner._reply_text(turn.result)
         if text:
             self.state.messages.append(Message(role="assistant", text=text, stamp=self._now()))
         elif turn.error:
-            self.state.messages.append(Message(role="error", text=turn.error, stamp=self._now()))
+            message = turn.error
+            lowered = message.lower()
+            if "terminated" in lowered or "socket hang up" in lowered:
+                message = "连接中断（terminated）。任务可能仍在服务端运行：用 /resume 续等，不要重发同一条消息"
+            elif "timeout" in lowered:
+                message = "等待超时，任务没有被取消：用 /resume 续等同一轮"
+            self.state.messages.append(Message(role="error", text=message, stamp=self._now()))
         else:
             status = (turn.result or {}).get("status") or ""
             hint = ""
@@ -1028,7 +1124,7 @@ class App:
 
     def _resume(self) -> None:
         if not self.state.conversation_id:
-            self._system("还没有会话 ID")
+            self._system("还没有会话 ID，先用 /sessions 看列表")
             return
         if self.state.started_at:
             self._system("当前已有任务在跑")
@@ -1037,6 +1133,22 @@ class App:
         if self.runner.start(argv, "wait"):
             self._system("续等同一轮任务")
             self.need_render = True
+
+    def _switch_session(self, conversation_id: str) -> None:
+        conversation_id = conversation_id.strip()
+        if not re.fullmatch(r"\d{12,24}", conversation_id):
+            self._system("会话 ID 应为 12–24 位数字")
+            return
+        if self.state.started_at:
+            self._system("当前有任务在跑，先等它结束或按 Esc 中断")
+            return
+        self.state.conversation_id = conversation_id
+        self.state.run_id = ""
+        self.runner.adopt(conversation_id, "")
+        self.config["last_conversation"] = conversation_id
+        save_config(self.config)
+        self._system(f"已切到会话 {conversation_id}，下一条消息会发到这里；有未完成轮就用 /resume 续等")
+        self.need_render = True
 
     def _command(self, line: str) -> None:
         parts = line[1:].split(None, 1)
@@ -1047,9 +1159,10 @@ class App:
         elif cmd in ("h", "help", "?"):
             self._system(
                 "按键：Enter 发送 · Ctrl+J 换行 · Esc 中断当前轮 · Tab 补全命令 · Ctrl+C 退出\n"
-                "命令：/new 新会话 · /resume 续等 · /sessions 会话列表 · /stop 中止 · /status 状态\n"
-                "　　　/mode work|chat|goal · /perm ask_risky|ask_always|always_allow · /ws <目录>\n"
-                "　　　/profile <名字> · /clear 清屏 · /quit 退出"
+                "命令：/new 新会话 · /sessions 会话列表 · /resume [ID] 续等或切换 · /stop 中止\n"
+                "　　　/model [名称] 查看或切换模型 · /mode work|chat|goal\n"
+                "　　　/perm ask_risky|ask_always|always_allow · /ws <目录> · /profile <名字>\n"
+                "　　　/status 状态 · /clear 清屏 · /quit 退出"
             )
         elif cmd == "new":
             self.state.conversation_id = ""
@@ -1057,7 +1170,10 @@ class App:
             self.runner.adopt("", "")
             self._system("下一个消息会开启新会话")
         elif cmd == "resume":
-            self._resume()
+            if rest:
+                self._switch_session(rest)
+            else:
+                self._resume()
         elif cmd == "stop":
             self.runner.stop()
             self._system("已请求中止")
@@ -1095,7 +1211,15 @@ class App:
             self.state.messages = []
             self.state.messages.append(Message(role="system", text="已清屏"))
         elif cmd == "sessions":
-            self._system("会话列表请用 /resume 续当前，或退出后跑 doubao headless sessions list")
+            self.runner.list_sessions()
+            self._system("正在读取会话列表…")
+        elif cmd == "model":
+            if rest:
+                self.runner.select_model(rest)
+                self._system(f"正在切换模型到 {rest}…")
+            else:
+                self.runner.list_models()
+                self._system("正在读取模型列表…")
         elif cmd == "r":
             self._resume()
         else:
@@ -1301,6 +1425,69 @@ def find_bin(name: str) -> Optional[str]:
     return path
 
 
+def run_doctor(config: dict) -> int:
+    """不进入界面，逐项检查运行前提。"""
+
+    ok = True
+
+    def line(name: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        print(("  ok   " if passed else "  FAIL ") + name + (f"  {detail}" if detail else ""))
+        if not passed:
+            ok = False
+
+    print("doubao-tui 自检")
+    print(f"  python {sys.version.split()[0]}")
+    print(f"  workspace {config.get('workspace') or os.getcwd()}")
+    print()
+
+    workspace = config.get("workspace") or os.getcwd()
+    line("工作区存在且可读", os.path.isdir(workspace) and os.access(workspace, os.R_OK), workspace)
+
+    base = [config["bin"], "headless"]
+    profile = config.get("profile")
+    suffix = ["--profile", str(profile)] if profile else []
+
+    def call(args: List[str], timeout: int = 25):
+        try:
+            return subprocess.run(base + args + suffix, capture_output=True, text=True, timeout=timeout)
+        except Exception as exc:
+            print(f"    （{args[0]} 调用失败：{exc}）")
+            return None
+
+    result = call(["status", "--json"])
+    if result is not None:
+        try:
+            data = json.loads((result.stdout or "").strip() or "{}")
+            line("账号已登录", bool(data.get("loggedIn")), f"accountId {data.get('accountId') or '-'}")
+        except Exception:
+            line("登录状态解析", False, ((result.stdout or "") + (result.stderr or ""))[:80])
+
+    result = call(["runtimes", "--json"])
+    if result is not None:
+        try:
+            data = json.loads((result.stdout or "").strip() or "{}")
+            rows = data.get("runtimes") or data.get("items") or []
+            local = next(
+                (row for row in rows if (row.get("name") or row.get("id") or row.get("runtime")) == "local"),
+                None,
+            )
+            if local:
+                line(
+                    "本地执行通道",
+                    bool(local.get("available", True)),
+                    f"{local.get('engine') or ''} / {local.get('hostPlatform') or ''}".strip(" /"),
+                )
+            else:
+                line("本地执行通道", False, "runtimes 里没有 local")
+        except Exception:
+            line("执行通道解析", False, ((result.stdout or "") + (result.stderr or ""))[:80])
+
+    print()
+    print("结论：" + ("全部通过，可以启动 doubao-tui" if ok else "有项目未通过，先修好再启动界面"))
+    return 0 if ok else 1
+
+
 def main(argv: List[str]) -> int:
     config = load_config()
     if not config.get("workspace"):
@@ -1314,6 +1501,9 @@ def main(argv: List[str]) -> int:
         )
         return 2
     config["bin"] = bin_path
+
+    if "--doctor" in argv:
+        return run_doctor(config)
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         sys.stderr.write("doubao-tui 必须在真实终端里运行\n")
@@ -1333,8 +1523,10 @@ def main(argv: List[str]) -> int:
                     app._answer(False)
                     return
                 if byte in (ord("a"), ord("A")):
+                    if app._auto_backup is None:
+                        app._auto_backup = list(app.config.get("auto_approve") or [])
                     app.config["auto_approve"] = ["*"]
-                    app._system("本轮后续请求全部放行")
+                    app._system("本轮后续请求全部放行（本轮结束后恢复）")
                     app._answer(True)
                     return
                 if byte == 0x03:
