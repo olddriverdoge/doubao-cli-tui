@@ -223,6 +223,44 @@ def run_esc_case():
     return base
 
 
+def run_query_case():
+    """/sessions 与 /model 走只读查询，不占任务槽。"""
+    base = tempfile.mkdtemp(prefix="dbtui-query-")
+    conf = os.path.join(base, "config")
+    os.makedirs(os.path.join(conf, "doubao-tui"))
+    workspace = os.path.join(base, "ws")
+    os.makedirs(workspace)
+    with open(os.path.join(conf, "doubao-tui", "config.json"), "w", encoding="utf-8") as handle:
+        json.dump({"bin": MOCK, "profile": "mock", "workspace": workspace, "mode": "work",
+                   "permission": "ask_risky", "timeout": 30}, handle)
+    env = dict(os.environ)
+    env["XDG_CONFIG_HOME"] = conf
+    env["TERM"] = "xterm-256color"
+    child = pexpect.spawn(sys.executable, [TUI], env=env, dimensions=(30, 90), encoding="utf-8", timeout=10, codec_errors="replace")
+    try:
+        child.expect("豆包 · work")
+        child.send("/sessions\r")
+        child.expect("最近会话", timeout=10)
+        check("/sessions 列出会话", True)
+        child.send("/model\r")
+        child.expect("可用模型", timeout=10)
+        check("/model 列出模型", True)
+        child.send("/status\r")
+        child.expect("阶段", timeout=10)
+        check("/status 可用", True)
+        child.send("/quit\r")
+        child.expect(pexpect.EOF, timeout=5)
+    except Exception as exc:
+        check("查询流程无异常", False, repr(exc))
+        print((child.before or "")[-600:])
+    finally:
+        try:
+            child.close(force=True)
+        except Exception:
+            pass
+    return base
+
+
 if __name__ == "__main__":
     print("== 主流程 ==")
     run_case()
@@ -232,6 +270,8 @@ if __name__ == "__main__":
     run_keys_case()
     print("== Esc 分支 ==")
     run_esc_case()
+    print("== 查询分支 ==")
+    run_query_case()
     if failures:
         print("失败：", failures)
         sys.exit(1)

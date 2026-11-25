@@ -42,6 +42,39 @@ def main(argv: list) -> int:
     for index, item in enumerate(argv):
         if item == "--workspace" and index + 1 < len(argv):
             workspace = argv[index + 1]
+
+    # 只读查询类命令：直接返回结构化结果，不进入任务流程
+    if "sessions" in argv and "list" in argv:
+        sys.stdout.write(json.dumps({
+            "sessions": [
+                {"id": CID, "title": "接管审计（mock）"},
+                {"id": "38450000000000002", "title": "脚手架冒烟"},
+            ],
+            "currentId": CID,
+        }, ensure_ascii=False))
+        return 0
+    if "models" in argv:
+        sys.stdout.write(json.dumps({
+            "models": [
+                {"name": "doubao-seed-2-0-pro", "reasoning": "high"},
+                {"name": "doubao-seed-2-0-lite", "reasoning": "off"},
+            ]
+        }, ensure_ascii=False))
+        return 0
+    if "model" in argv and "select" in argv:
+        pos = argv.index("select")
+        name = argv[pos + 1] if pos + 1 < len(argv) else "unknown"
+        sys.stdout.write(json.dumps({"model": name, "changed": True}, ensure_ascii=False))
+        return 0
+    if "status" in argv:
+        sys.stdout.write(json.dumps({"loggedIn": True, "accountId": "1342919234290264"}, ensure_ascii=False))
+        return 0
+    if "runtimes" in argv:
+        sys.stdout.write(json.dumps({
+            "runtimes": [{"name": "local", "available": True, "engine": "node-http-sse", "hostPlatform": "android"}]
+        }, ensure_ascii=False))
+        return 0
+
     message = ""
     if "create" in argv:
         pos = argv.index("create")
